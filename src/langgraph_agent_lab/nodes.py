@@ -25,23 +25,35 @@ def intake_node(state: AgentState) -> dict:
 def classify_node(state: AgentState) -> dict:
     """Classify the query into a route.
 
-    TODO(student): replace keyword heuristics with a clear routing policy.
-    Required routes: simple, tool, missing_info, risky, error.
+    Priority order: RISKY > TOOL > ERROR > MISSING_INFO > SIMPLE.
+    This prevents keyword conflicts (e.g., "check order for refund" → risky, not tool).
     """
     query = state.get("query", "").lower()
     words = query.split()
     clean_words = [w.strip("?!.,;:") for w in words]
+    
     route = Route.SIMPLE
     risk_level = "low"
-    if "refund" in query or "delete" in query or "send" in query:
+    
+    # Priority 1: RISKY keywords (highest priority - destructive actions)
+    risky_keywords = ["refund", "delete", "remove", "cancel", "send", "revoke"]
+    if any(kw in query for kw in risky_keywords):
         route = Route.RISKY
         risk_level = "high"
-    elif "status" in query or "order" in query or "lookup" in query:
+    # Priority 2: TOOL keywords (external lookup needed)
+    elif any(kw in query for kw in ["status", "order", "lookup", "check", "track", "find", "search"]):
         route = Route.TOOL
+        risk_level = "low"
+    # Priority 3: ERROR keywords (transient/system failures)
+    elif any(kw in query for kw in ["timeout", "fail", "error", "crash", "unavailable"]):
+        route = Route.ERROR
+        risk_level = "low"
+    # Priority 4: MISSING_INFO (vague queries - very short with pronouns)
     elif len(clean_words) < 5 and "it" in clean_words:
         route = Route.MISSING_INFO
-    elif "timeout" in query or "fail" in query:
-        route = Route.ERROR
+        risk_level = "low"
+    # Priority 5: SIMPLE (default - safe responses)
+    
     return {
         "route": route.value,
         "risk_level": risk_level,
@@ -149,35 +161,55 @@ def answer_node(state: AgentState) -> dict:
 
 
 def evaluate_node(state: AgentState) -> dict:
-    """Evaluate tool results — the 'done?' check that enables retry loops.
+    """Evaluate tool result to decide retry vs success.
 
-    TODO(student): replace heuristic with LLM-as-judge or structured validation.
+    This is the key retry-loop gate: checks if tool result indicates success or needs retry.
     """
     tool_results = state.get("tool_results", [])
-    latest = tool_results[-1] if tool_results else ""
-    if "ERROR" in latest:
-        return {
-            "evaluation_result": "needs_retry",
-            "events": [make_event("evaluate", "completed", "tool result indicates failure, retry needed")],
-        }
+    if not tool_results:
+        return {"evaluation_result": "success"}
+    
+    last_result = tool_results[-1]
+    
+    # If result contains ERROR keyword and attempt < max_attempts, mark for retry
+    if "ERROR:" in last_result and int(state.get("attempt", 0)) < int(state.get("max_attempts", 3)):
+        evaluation_result = "needs_retry"
+    else:
+        evaluation_result = "success"
+    
     return {
-        "evaluation_result": "success",
-        "events": [make_event("evaluate", "completed", "tool result satisfactory")],
+        "evaluation_result": evaluation_result,
+        "events": [make_event("evaluate", "completed", f"evaluation={evaluation_result}")],
     }
 
 
 def dead_letter_node(state: AgentState) -> dict:
-    """Log unresolvable failures for manual review.
+    """Log failure when max retries exhausted.
 
-    Third layer of error strategy: retry -> fallback -> dead letter.
-    TODO(student): persist to dead-letter queue, alert on-call, or create support ticket.
+    Called when attempt >= max_attempts and retry loop cannot continue.
     """
+    attempt = state.get("attempt", 0)
+    max_attempts = state.get("max_attempts", 3)
+    errors = state.get("errors", [])
+    
+    message = f"Dead letter: exhausted {attempt} attempts (max={max_attempts})"
     return {
-        "final_answer": "Request could not be completed after maximum retry attempts. Logged for manual review.",
-        "events": [make_event("dead_letter", "completed", f"max retries exceeded, attempt={state.get('attempt', 0)}")],
+        "final_answer": f"Unable to resolve after {attempt} attempts. Escalating to support team.",
+        "errors": errors + [message],
+        "events": [make_event("dead_letter", "exhausted", message)],
     }
 
 
 def finalize_node(state: AgentState) -> dict:
-    """Finalize the run and emit a final audit event."""
-    return {"events": [make_event("finalize", "completed", "workflow finished")]}
+    """Finalize the response and prepare for output.
+
+    All paths converge here before END.
+    """
+    scenario_id = state.get("scenario_id", "unknown")
+    route = state.get("route", "unknown")
+    final_answer = state.get("final_answer", "No answer generated")
+    
+    return {
+        "final_answer": final_answer,
+        "events": [make_event("finalize", "completed", f"scenario={scenario_id} route={route}")],
+    }

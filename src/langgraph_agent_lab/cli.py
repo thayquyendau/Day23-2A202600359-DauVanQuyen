@@ -34,8 +34,27 @@ def run_scenarios(
         state = initial_state(scenario)
         run_config = {"configurable": {"thread_id": state["thread_id"]}}
         final_state = graph.invoke(state, config=run_config)
-        metrics.append(metric_from_state(final_state, scenario.expected_route.value, scenario.requires_approval))
-    report = summarize_metrics(metrics)
+        metrics.append(
+            metric_from_state(
+                final_state,
+                scenario.expected_route.value,
+                scenario.requires_approval,
+            )
+        )
+
+    resume_success = False
+    if cfg.get("checkpointer") == "sqlite" and scenarios:
+        probe_scenario = scenarios[0]
+        probe_state = initial_state(probe_scenario)
+        probe_config = {"configurable": {"thread_id": probe_state["thread_id"]}}
+        graph.invoke(probe_state, config=probe_config)
+        try:
+            history = list(graph.get_state_history(probe_config))
+            resume_success = len(history) >= 2
+        except Exception:
+            resume_success = False
+
+    report = summarize_metrics(metrics, resume_success=resume_success)
     write_metrics(report, output)
     if cfg.get("report_path"):
         write_report(report, cfg["report_path"])
